@@ -1,0 +1,298 @@
+package spannerdriver
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+
+	"database/sql"
+	"database/sql/driver"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"cloud.google.com/go/spanner"
+	adminapi "cloud.google.com/go/spanner/admin/database/apiv1"
+	instanceapi "cloud.google.com/go/spanner/admin/instance/apiv1"
+	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
+	instancepb "google.golang.org/genproto/googleapis/spanner/admin/instance/v1"
+)
+
+var (
+	_ driver.Driver        = &SpannerDriver{}
+	_ driver.DriverContext = &SpannerDriver{}
+)
+
+var (
+	dsn      string
+	project  string
+	instance string
+	database string
+)
+
+func init() {
+	env := func(key, defaultValue string) string {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+		return defaultValue
+	}
+	emulator_host := env("SPANNER_EMULATOR_HOST", "")
+	if emulator_host == "" {
+		panic("cannot setup spanner because env 'SPANNER_EMULATOR_HOST' is not set")
+	}
+
+	project = env("SPANNER_GCP_PROJECT", "sql-driver-spanner-project")
+	instance = env("SPANNER_INSTANCE", "sql-driver-spanner-instance")
+	database = env("SPANNER_DATABASE", "testdb")
+	dsn = fmt.Sprintf("projects/%s/instances/%s/databases/%s", project, instance, database)
+}
+
+var clientConfig = spanner.ClientConfig{
+	SessionPoolConfig: spanner.SessionPoolConfig{
+		MinOpened: 1,
+		MaxOpened: 10, // FIXME: integration_test requires more than a single session
+	},
+}
+
+type DBTest struct {
+	*testing.T
+	db     *sql.DB
+	client *spanner.Client
+}
+
+func (dbt *DBTest) mustExec(query string, args ...interface{}) (res sql.Result) {
+	res, err := dbt.db.Exec(query, args...)
+	if err != nil {
+		dbt.fail("exec", query, err)
+	}
+	return res
+}
+
+func (dbt *DBTest) fail(method, query string, err error) {
+	if len(query) > 300 {
+		query = "[query too large to print]"
+	}
+	dbt.Fatalf("error on %s %s: %s", method, query, err.Error())
+}
+
+func (dbt *DBTest) mustQuery(query string, args ...interface{}) (rows *sql.Rows) {
+	rows, err := dbt.db.Query(query, args...)
+	if err != nil {
+		dbt.fail("query", query, err)
+	}
+	return rows
+}
+
+func runTests(t *testing.T, dsn string, tests ...func(dbt *DBTest)) {
+	ctx := context.Background()
+	db, err := sql.Open("spanner", dsn)
+	if err != nil {
+		t.Fatalf("error connecting database: %+v", err)
+	}
+	dbt := &DBTest{db: db, T: t}
+
+	deleteInstance(ctx, t)
+	createInstance(ctx, t)
+	createDatabase(ctx, t)
+
+	for _, test := range tests {
+		dropTable(ctx, t)
+		createTable(ctx, t)
+		test(dbt)
+	}
+
+	deleteInstance(ctx, t)
+}
+
+func createDatabase(ctx context.Context, t *testing.T) {
+	client, err := adminapi.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		t.Fatalf("error connecting instance: %+v", err)
+	}
+	defer client.Close()
+
+	_, err = client.GetDatabase(ctx, &adminpb.GetDatabaseRequest{
+		Name: dsn,
+	})
+	if err == nil {
+		return
+	} else if status.Code(err) != codes.NotFound {
+		t.Fatalf("error get database: %+v", err)
+	}
+
+	op, err := client.CreateDatabase(ctx, &adminpb.CreateDatabaseRequest{
+		Parent:          fmt.Sprintf("projects/%s/instances/%s", project, instance),
+		CreateStatement: fmt.Sprintf("CREATE DATABASE %s", database),
+	})
+	if err != nil {
+		t.Fatalf("error create database: %+v", err)
+	}
+
+	if _, err := op.Wait(ctx); err != nil {
+		t.Fatalf("error create database operation: %+v", err)
+	}
+}
+
+func deleteInstance(ctx context.Context, t *testing.T) {
+	client, err := instanceapi.NewInstanceAdminClient(ctx)
+	if err != nil {
+		t.Fatalf("error connecting instance: %+v", err)
+	}
+	defer client.Close()
+
+	_, err = client.GetInstance(ctx, &instancepb.GetInstanceRequest{
+		Name: dsn,
+	})
+	if status.Code(err) == codes.NotFound {
+		return
+	} else if err != nil {
+		t.Fatalf("error get instance: %+v", err)
+	}
+
+	err = client.DeleteInstance(ctx, &instancepb.DeleteInstanceRequest{
+		Name: fmt.Sprintf("projects/%s/instances/%s", project, instance),
+	})
+	if err != nil {
+		t.Fatalf("error delete instance: %+v", err)
+	}
+}
+
+func createInstance(ctx context.Context, t *testing.T) {
+	client, err := instanceapi.NewInstanceAdminClient(ctx)
+	if err != nil {
+		t.Fatalf("error connecting instance: %+v", err)
+	}
+	defer client.Close()
+
+	_, err = client.GetInstance(ctx, &instancepb.GetInstanceRequest{
+		Name: fmt.Sprintf("projects/%s/instances/%s", project, instance),
+	})
+	if err == nil {
+		return
+	} else if status.Code(err) != codes.NotFound {
+		t.Fatalf("error get instance: %+v", err)
+	}
+
+	op, err := client.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
+		Parent:     fmt.Sprintf("projects/%s", project),
+		InstanceId: instance,
+		Instance: &instancepb.Instance{
+			Config:      fmt.Sprintf("/projects/%s/instanceConfigs/test", project),
+			DisplayName: "Test Instance",
+			NodeCount:   1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("error create instance: %+v", err)
+	}
+
+	if _, err := op.Wait(ctx); err != nil {
+		t.Fatalf("error create instance operation: %+v", err)
+	}
+}
+
+func createTable(ctx context.Context, t *testing.T) {
+	client, err := adminapi.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		t.Fatalf("error connecting database api: %+v", err)
+	}
+	defer client.Close()
+
+	op, err := client.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
+		Database:   dsn,
+		Statements: []string{"CREATE TABLE test (`Id` STRING(36) NOT NULL, `Value` BOOL) PRIMARY KEY (`Id`)"},
+	})
+	if err != nil {
+		t.Fatalf("error create table: %+v", err)
+	}
+
+	if err := op.Wait(ctx); err != nil {
+		t.Fatalf("error create table operation: %+v", err)
+	}
+}
+
+func dropTable(ctx context.Context, t *testing.T) {
+	client, err := adminapi.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		t.Fatalf("error connecting database api: %+v", err)
+	}
+	defer client.Close()
+
+	op, err := client.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
+		Database:   dsn,
+		Statements: []string{"DROP TABLE test"},
+	})
+	if err != nil {
+		t.Fatalf("error drop table: %+v", err)
+	}
+
+	if err := op.Wait(ctx); err != nil {
+		t.Fatalf("error drop table operation: %+v", err)
+	}
+}
+
+func TestCRUD(t *testing.T) {
+	runTests(t, dsn, func(dbt *DBTest) {
+		// Test for unexpected data
+		var out bool
+		rows := dbt.mustQuery("SELECT * FROM test")
+		if rows.Next() {
+			dbt.Error("unexpected data in empty table")
+		}
+		rows.Close()
+
+		// Create Data
+		res := dbt.mustExec("INSERT INTO test (Id, Value) VALUES (@id, @value)", "userId1", true)
+		count, err := res.RowsAffected()
+		if err != nil {
+			dbt.Fatalf("res.RowsAffected() returned error: %+v", err)
+		}
+		if count != 1 {
+			dbt.Fatalf("expected 1 affected row, got %d", count)
+		}
+
+		// Read
+		rows = dbt.mustQuery("SELECT value FROM test WHERE Id = @id", "userId1")
+		if rows.Next() {
+			rows.Scan(&out)
+			if true != out {
+				dbt.Errorf("true != %t", out)
+			}
+
+			if rows.Next() {
+				dbt.Error("unexpected data")
+			}
+		} else {
+			dbt.Error("no data")
+		}
+		rows.Close()
+
+		// Update
+		res = dbt.mustExec("UPDATE test SET value = @value WHERE value = @value", false, true)
+		count, err = res.RowsAffected()
+		if err != nil {
+			dbt.Fatalf("res.RowsAffected() returned error: %s", err.Error())
+		}
+		if count != 1 {
+			dbt.Fatalf("expected 1 affected row, got %d", count)
+		}
+
+		// Check Update
+		rows = dbt.mustQuery("SELECT value FROM test")
+		if rows.Next() {
+			rows.Scan(&out)
+			if false != out {
+				dbt.Errorf("false != %t", out)
+			}
+
+			if rows.Next() {
+				dbt.Error("unexpected data")
+			}
+		} else {
+			dbt.Error("no data")
+		}
+		rows.Close()
+	})
+}
