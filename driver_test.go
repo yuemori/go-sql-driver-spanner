@@ -245,8 +245,18 @@ func TestCRUD(t *testing.T) {
 		rows.Close()
 
 		// Create Data
-		res := dbt.mustExec("INSERT INTO test (Id, Value) VALUES (@id, @value)", "userId1", true)
+		res := dbt.mustExec("INSERT INTO test (Id, Value) VALUES (\"userId1\", true)")
 		count, err := res.RowsAffected()
+		if err != nil {
+			dbt.Fatalf("res.RowsAffected() returned error: %+v", err)
+		}
+		if count != 1 {
+			dbt.Fatalf("expected 1 affected row, got %d", count)
+		}
+
+		// Create Data with params
+		res = dbt.mustExec("INSERT INTO test (Id, Value) VALUES (@id, @value)", "userId2", false)
+		count, err = res.RowsAffected()
 		if err != nil {
 			dbt.Fatalf("res.RowsAffected() returned error: %+v", err)
 		}
@@ -281,7 +291,7 @@ func TestCRUD(t *testing.T) {
 		}
 
 		// Check Update
-		rows = dbt.mustQuery("SELECT value FROM test")
+		rows = dbt.mustQuery("SELECT value FROM test Where Id = \"userId1\"")
 		if rows.Next() {
 			rows.Scan(&out)
 			if false != out {
@@ -302,7 +312,7 @@ func TestCRUD(t *testing.T) {
 		if err != nil {
 			dbt.Fatalf("res.RowsAffected() returned error: %s", err.Error())
 		}
-		if count != 1 {
+		if count != 2 {
 			dbt.Fatalf("expected 1 affected row, got %d", count)
 		}
 

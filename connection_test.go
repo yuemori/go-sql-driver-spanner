@@ -11,6 +11,6 @@ var (
 	_ driver.ConnPrepareContext = &spannerConn{}
 	_ driver.ExecerContext      = &spannerConn{}
 	_ driver.QueryerContext     = &spannerConn{}
-	_ driver.Pinger             = &spannerConn{}
-	_ driver.SessionResetter    = &spannerConn{}
+	// _ driver.Pinger             = &spannerConn{}
+	// _ driver.SessionResetter    = &spannerConn{}
 )

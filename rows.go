@@ -2,7 +2,6 @@ package spannerdriver
 
 import (
 	"database/sql/driver"
-	"encoding/base64"
 	"io"
 	"sync"
 	"time"
@@ -71,8 +70,8 @@ func (r *spannerRows) readRow(dest []driver.Value) error {
 		var col spanner.GenericColumnValue
 		if err := r.currentRow.Column(i, &col); err != nil {
 			return err
+			dest[i] = col
 		}
-		dest[i] = col
 
 		switch col.Type.Code {
 		case sppb.TypeCode_BOOL:
@@ -116,20 +115,11 @@ func (r *spannerRows) readRow(dest []driver.Value) error {
 			}
 			dest[i] = v.StringVal
 		case sppb.TypeCode_BYTES:
-			// The column value is a base64 encoded string.
-			var v spanner.NullString
+			var v []byte
 			if err := col.Decode(&v); err != nil {
 				return err
 			}
-			if v.IsNull() {
-				dest[i] = []byte(nil)
-			} else {
-				b, err := base64.StdEncoding.DecodeString(v.StringVal)
-				if err != nil {
-					return err
-				}
-				dest[i] = b
-			}
+			dest[i] = v
 		case sppb.TypeCode_ARRAY:
 			return errors.Errorf("unsupported type: %s", col.Type.Code)
 		case sppb.TypeCode_STRUCT:
@@ -149,6 +139,7 @@ func (r *spannerRows) readRow(dest []driver.Value) error {
 // func (r *spannerRows) ColumnTypeDatabaseTypeName(index int) string {
 // 	return ""
 // }
+
 //
 // // ColumnTypeLength implements database/sql/driver.RowsColumnTypeLength interface.
 // func (r *spannerRows) ColumnTypeLength(index int) (length int64, ok bool) {

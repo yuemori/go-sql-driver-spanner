@@ -1,9 +1,14 @@
 package spannerdriver
 
 import (
-	"errors"
 	"log"
 	"os"
+
+	"github.com/pkg/errors"
+)
+
+var (
+	ErrInvalidConn = errors.New("invalid connection")
 )
 
 // Logger is used to log critical error messages.
@@ -21,4 +26,8 @@ func SetLogger(logger Logger) error {
 	}
 	errLog = logger
 	return nil
+}
+
+func notImplementedError(receiver interface{}, name string) error {
+	return errors.Errorf("%T does not implemented: %s", receiver, name)
 }

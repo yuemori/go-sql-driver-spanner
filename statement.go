@@ -9,18 +9,24 @@ import (
 )
 
 type spannerStmt struct {
-	conn  *spannerConn
-	query string
+	conn    *spannerConn
+	numArgs int
+	query   string
 }
 
 // Close implements database/sql/driver.Stmt interface.
 func (stmt *spannerStmt) Close() error {
-	return notImplementedError(stmt, "Close")
+	if stmt.conn == nil || stmt.conn.closed.IsSet() {
+		return driver.ErrBadConn
+	}
+
+	stmt.conn = nil
+	return nil
 }
 
 // NumInput implements database/sql/driver.Stmt interface.
 func (stmt *spannerStmt) NumInput() int {
-	return 0
+	return stmt.numArgs
 }
 
 // Exec implements database/sql/driver.Stmt interface.
@@ -40,7 +46,7 @@ func (stmt *spannerStmt) ExecContext(ctx context.Context, args []driver.NamedVal
 
 // QueryContext implements database/sql/driver.StmtQueryContext interface.
 func (s *spannerStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	return s.conn.queryContext(ctx, s.query, args)
+	return s.conn.query(ctx, s.query, args)
 }
 
 // CheckNamedValue implements database/sql/driver.NamedValueChecker interface.

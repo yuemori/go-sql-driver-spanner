@@ -3,9 +3,11 @@ package spannerdriver
 import (
 	"context"
 	"database/sql/driver"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	"github.com/pkg/errors"
+	"github.com/yuemori/go-sql-driver-spanner/internal"
 	"google.golang.org/api/iterator"
 )
 
@@ -14,21 +16,34 @@ type spannerConn struct {
 
 	roTx *spanner.ReadOnlyTransaction
 	rwTx *rwTx
-}
 
-func notImplementedError(receiver interface{}, name string) error {
-	return errors.Errorf("%T does not implemented: %s", receiver, name)
+	closed atomicBool
 }
 
 // Prepare implements database/sql/driver.Conn interface
 func (c *spannerConn) Prepare(query string) (driver.Stmt, error) {
-	return nil, notImplementedError(c, "Prepare")
+	if c.closed.IsSet() {
+		errLog.Print(ErrInvalidConn)
+		return nil, driver.ErrBadConn
+	}
+
+	return c.prepare(query)
 }
 
 // Close implements database/sql/driver.Conn interface
 func (c *spannerConn) Close() error {
-	c.client.Close()
+	c.cleanup()
 	return nil
+}
+
+func (c *spannerConn) cleanup() {
+	if !c.closed.TrySet(true) {
+		return
+	}
+
+	c.roTx = nil
+	c.rwTx = nil
+	c.client = nil
 }
 
 // Begin implements database/sql/driver.Conn interface
@@ -38,16 +53,56 @@ func (c *spannerConn) Begin() (driver.Tx, error) {
 
 // BeginTx implements database/sql/driver.ConnBeginTx interface
 func (c *spannerConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.closed.IsSet() {
+		errLog.Print(ErrInvalidConn)
+		return nil, driver.ErrBadConn
+	}
+
+	if c.inTransaction() {
+		return nil, errors.New("already in a transaction")
+	}
+
+	if opts.ReadOnly {
+		c.roTx = c.client.ReadOnlyTransaction().WithTimestampBound(spanner.StrongRead())
+		return &roTx{close: func() {
+			c.roTx.Close()
+			c.roTx = nil
+		}}, nil
+	}
+
+	connector := internal.NewRWConnector(ctx, c.client)
+	c.rwTx = &rwTx{
+		connector: connector,
+		close: func() {
+			c.rwTx = nil
+		},
+	}
+
+	// TODO(jbd): Make sure we are not leaking
+	// a goroutine in connector if timeout happens.
+	select {
+	case <-connector.Ready:
+		return c.rwTx, nil
+	case err := <-connector.Errors: // If received before Ready, transaction failed to start.
+		return nil, err
+	case <-time.Tick(10 * time.Second):
+		return nil, errors.New("cannot begin transaction, timeout after 10 seconds")
+	}
 	return nil, notImplementedError(c, "BeginTx")
 }
 
 // PrepareContext implements database/sql/driver.ConnPrepareContext interface
 func (c *spannerConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	return nil, notImplementedError(c, "PrepareContext")
+	return c.prepare(query)
 }
 
 // ExecContext implements database/sql/driver.ExecerContext interface
 func (c *spannerConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.closed.IsSet() {
+		errLog.Print(ErrInvalidConn)
+		return nil, driver.ErrBadConn
+	}
+
 	if c.roTx != nil {
 		return nil, errors.New("cannot write in read-only transaction")
 	}
@@ -70,17 +125,39 @@ func (c *spannerConn) ExecContext(ctx context.Context, query string, args []driv
 
 // QueryContext implements database/sql/driver.QueryerContext interface
 func (c *spannerConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	return c.queryContext(ctx, query, args)
+	return c.query(ctx, query, args)
 }
 
 // Ping implements database/sql/driver.Pinger interface
 func (c *spannerConn) Ping(ctx context.Context) error {
-	return notImplementedError(c, "Ping")
+	if c.closed.IsSet() {
+		errLog.Print(ErrInvalidConn)
+		return driver.ErrBadConn
+	}
+	if c.inTransaction() {
+		return nil
+	}
+
+	_, err := c.query(context.Background(), "SELECT 1", []driver.NamedValue{})
+
+	return err
 }
 
 // ResetSession implements database/sql/driver.SessionResetter interface
 func (c *spannerConn) ResetSession(ctx context.Context) error {
-	return notImplementedError(c, "ResetSession")
+	if c.closed.IsSet() {
+		return driver.ErrBadConn
+	}
+	c.roTx = nil
+	c.rwTx = nil
+
+	return nil
+}
+
+// IsValid implements database/sql/driver.Validator interface
+// (From Go 1.15)
+func (c *spannerConn) IsValid() bool {
+	return !c.closed.IsSet()
 }
 
 func (c *spannerConn) execContextInNewRWTransaction(ctx context.Context, statement spanner.Statement) (int64, error) {
@@ -97,7 +174,12 @@ func (c *spannerConn) execContextInNewRWTransaction(ctx context.Context, stateme
 	return rowsAffected, nil
 }
 
-func (conn *spannerConn) queryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (conn *spannerConn) query(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if conn.closed.IsSet() {
+		errLog.Print(ErrInvalidConn)
+		return nil, driver.ErrBadConn
+	}
+
 	ss, err := prepareSpannerStmt(query, args)
 	if err != nil {
 		return nil, err
@@ -120,4 +202,22 @@ func (conn *spannerConn) queryContext(ctx context.Context, query string, args []
 	}
 
 	return &spannerRows{dirtyRow: row, it: it, done: false}, nil
+}
+
+func (c *spannerConn) prepare(query string) (*spannerStmt, error) {
+	if c.closed.IsSet() {
+		errLog.Print(ErrInvalidConn)
+		return nil, driver.ErrBadConn
+	}
+
+	// TODO(jbd): Mention emails need to be escaped.
+	args, err := internal.NamedValueParamNames(query, -1)
+	if err != nil {
+		return nil, err
+	}
+	return &spannerStmt{conn: c, query: query, numArgs: len(args)}, nil
+}
+
+func (c *spannerConn) inTransaction() bool {
+	return c.roTx != nil || c.rwTx != nil
 }
