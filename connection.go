@@ -6,6 +6,7 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/pkg/errors"
+	"google.golang.org/api/iterator"
 )
 
 type spannerConn struct {
@@ -26,7 +27,8 @@ func (c *spannerConn) Prepare(query string) (driver.Stmt, error) {
 
 // Close implements database/sql/driver.Conn interface
 func (c *spannerConn) Close() error {
-	return notImplementedError(c, "Close")
+	c.client.Close()
+	return nil
 }
 
 // Begin implements database/sql/driver.Conn interface
@@ -109,5 +111,13 @@ func (conn *spannerConn) queryContext(ctx context.Context, query string, args []
 	} else {
 		it = conn.client.Single().Query(ctx, ss)
 	}
-	return &spannerRows{it: it}, nil
+
+	row, err := it.Next()
+	if err == iterator.Done {
+		return &spannerRows{it: it, done: true}, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	return &spannerRows{dirtyRow: row, it: it, done: false}, nil
 }

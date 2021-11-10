@@ -91,6 +91,7 @@ func runTests(t *testing.T, dsn string, tests ...func(dbt *DBTest)) {
 	if err != nil {
 		t.Fatalf("error connecting database: %+v", err)
 	}
+	defer db.Close()
 	dbt := &DBTest{db: db, T: t}
 
 	deleteInstance(ctx, t)
@@ -270,7 +271,7 @@ func TestCRUD(t *testing.T) {
 		rows.Close()
 
 		// Update
-		res = dbt.mustExec("UPDATE test SET value = @value WHERE value = @value", false, true)
+		res = dbt.mustExec("UPDATE test SET value = @value1 WHERE value = @value2", false, true)
 		count, err = res.RowsAffected()
 		if err != nil {
 			dbt.Fatalf("res.RowsAffected() returned error: %s", err.Error())
@@ -294,5 +295,31 @@ func TestCRUD(t *testing.T) {
 			dbt.Error("no data")
 		}
 		rows.Close()
+
+		// Delete
+		res = dbt.mustExec("DELETE FROM test WHERE value = @value", false)
+		count, err = res.RowsAffected()
+		if err != nil {
+			dbt.Fatalf("res.RowsAffected() returned error: %s", err.Error())
+		}
+		if count != 1 {
+			dbt.Fatalf("expected 1 affected row, got %d", count)
+		}
+
+		// Check for unexpected rows
+		rows = dbt.mustQuery("SELECT * FROM test")
+		if rows.Next() {
+			rows.Scan(&out)
+			dbt.Fatalf("unexpected rows found: %v", out)
+		}
+	})
+}
+
+func TestInvalidQuery(t *testing.T) {
+	runTests(t, dsn, func(dbt *DBTest) {
+		_, err := dbt.db.Query("this is invalid query")
+		if err == nil {
+			dbt.Fatal("db.Query does not returns expected error")
+		}
 	})
 }

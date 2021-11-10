@@ -4,11 +4,11 @@ import (
 	"database/sql/driver"
 	"encoding/base64"
 	"io"
-	"log"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
+	"github.com/pkg/errors"
 	"google.golang.org/api/iterator"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 )
@@ -17,29 +17,22 @@ type spannerRows struct {
 	it *spanner.RowIterator
 
 	colsOnce sync.Once
-	cols     []string
+	done     bool
 
-	dirtyRow *spanner.Row
-}
-
-func (r *spannerRows) getColumns() {
-	r.colsOnce.Do(func() {
-		row, err := r.it.Next()
-		if err == iterator.Done {
-			return
-		} else if err != nil {
-			log.Printf("error: error from *spanner.RowIterator %+v", err)
-			return
-		}
-		r.dirtyRow = row
-		r.cols = row.ColumnNames()
-	})
+	dirtyRow   *spanner.Row
+	currentRow *spanner.Row
 }
 
 // Columns implements database/sql/driver.Rows interface.
 func (r *spannerRows) Columns() []string {
-	r.getColumns()
-	return r.cols
+	if r.dirtyRow != nil {
+		return r.dirtyRow.ColumnNames()
+	}
+	if r.currentRow != nil {
+		return r.currentRow.ColumnNames()
+	}
+
+	return []string{}
 }
 
 // Close implements database/sql/driver.Rows interface.
@@ -50,28 +43,44 @@ func (r *spannerRows) Close() error {
 
 // Next implements database/sql/driver.Rows interface.
 func (r *spannerRows) Next(dest []driver.Value) error {
-	r.getColumns()
-	var row *spanner.Row
-	if r.dirtyRow != nil {
-		row = r.dirtyRow
-		r.dirtyRow = nil
-	} else {
-		var err error
-		row, err = r.it.Next() // returns io.EOF when there is no next
-		if err == iterator.Done {
-			return io.EOF
-		}
-		if err != nil {
-			return err
-		}
+	if r.done {
+		return io.EOF
 	}
 
-	for i := 0; i < row.Size(); i++ {
+	if r.dirtyRow != nil {
+		r.currentRow = r.dirtyRow
+		r.dirtyRow = nil
+		return r.readRow(dest)
+	}
+
+	var err error
+	r.currentRow, err = r.it.Next() // returns io.EOF when there is no next
+	if err == iterator.Done {
+		r.done = true
+		return io.EOF
+	}
+	if err != nil {
+		errLog.Print(err)
+		return err
+	}
+	return r.readRow(dest)
+}
+
+func (r *spannerRows) readRow(dest []driver.Value) error {
+	for i := 0; i < r.currentRow.Size(); i++ {
 		var col spanner.GenericColumnValue
-		if err := row.Column(i, &col); err != nil {
+		if err := r.currentRow.Column(i, &col); err != nil {
 			return err
 		}
+		dest[i] = col
+
 		switch col.Type.Code {
+		case sppb.TypeCode_BOOL:
+			var v spanner.NullBool
+			if err := col.Decode(&v); err != nil {
+				return err
+			}
+			dest[i] = v.Bool
 		case sppb.TypeCode_INT64:
 			var v spanner.NullInt64
 			if err := col.Decode(&v); err != nil {
@@ -84,6 +93,22 @@ func (r *spannerRows) Next(dest []driver.Value) error {
 				return err
 			}
 			dest[i] = v.Float64
+		case sppb.TypeCode_TIMESTAMP:
+			var v spanner.NullTime
+			if err := col.Decode(&v); err != nil {
+				return err
+			}
+			dest[i] = v.Time
+		case sppb.TypeCode_DATE:
+			var v spanner.NullDate
+			if err := col.Decode(&v); err != nil {
+				return err
+			}
+			if v.IsNull() {
+				dest[i] = v.Date // typed nil
+			} else {
+				dest[i] = v.Date.In(time.Local) // TODO(jbd): Add note about this.
+			}
 		case sppb.TypeCode_STRING:
 			var v spanner.NullString
 			if err := col.Decode(&v); err != nil {
@@ -105,31 +130,17 @@ func (r *spannerRows) Next(dest []driver.Value) error {
 				}
 				dest[i] = b
 			}
-		case sppb.TypeCode_BOOL:
-			var v spanner.NullBool
-			if err := col.Decode(&v); err != nil {
-				return err
-			}
-			dest[i] = v.Bool
-		case sppb.TypeCode_DATE:
-			var v spanner.NullDate
-			if err := col.Decode(&v); err != nil {
-				return err
-			}
-			if v.IsNull() {
-				dest[i] = v.Date // typed nil
-			} else {
-				dest[i] = v.Date.In(time.Local) // TODO(jbd): Add note about this.
-			}
-		case sppb.TypeCode_TIMESTAMP:
-			var v spanner.NullTime
-			if err := col.Decode(&v); err != nil {
-				return err
-			}
-			dest[i] = v.Time
+		case sppb.TypeCode_ARRAY:
+			return errors.Errorf("unsupported type: %s", col.Type.Code)
+		case sppb.TypeCode_STRUCT:
+			return errors.Errorf("unsupported type: %s", col.Type.Code)
+		case sppb.TypeCode_NUMERIC:
+			return errors.Errorf("unsupported type: %s", col.Type.Code)
+		case sppb.TypeCode_JSON:
+			return errors.Errorf("unsupported type: %s", col.Type.Code)
+		default:
+			return errors.Errorf("unsupported type: %s", col.Type.Code)
 		}
-		// TODO(jbd): Implement other types.
-		// How to handle array and struct?
 	}
 	return nil
 }
