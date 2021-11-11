@@ -38,6 +38,17 @@ func (c *SpannerConnector) Driver() driver.Driver {
 }
 
 // Connect implements database/sql/driver.Connector interface
-func (c *SpannerConnector) Connect(context.Context) (driver.Conn, error) {
-	return &spannerConn{client: c.client}, nil
+func (c *SpannerConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn := &spannerConn{
+		client:  c.client,
+		closech: make(chan struct{}),
+	}
+	conn.startWatcher()
+	if err := conn.watchCancel(ctx); err != nil {
+		conn.cleanup()
+		return nil, err
+	}
+	defer conn.finish()
+
+	return conn, nil
 }

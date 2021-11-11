@@ -21,6 +21,7 @@ func (tx *rwTx) Commit() (err error) {
 		return ErrInvalidConn
 	}
 	_, err = tx.conn.rwTx.Commit(tx.ctx)
+	tx.close()
 	tx.conn = nil
 	return
 }
@@ -29,7 +30,8 @@ func (tx *rwTx) Rollback() (err error) {
 	if tx.conn == nil || tx.conn.rwTx == nil || tx.conn.closed.IsSet() {
 		return ErrInvalidConn
 	}
-	tx.conn.rwTx.Rollback(tx.ctx)
+	tx.conn.rwTx.Rollback(context.Background())
+	tx.close()
 	tx.conn = nil
 	return
 }
@@ -38,7 +40,7 @@ func (tx *roTx) Commit() (err error) {
 	if tx.conn == nil || tx.conn.roTx == nil || tx.conn.closed.IsSet() {
 		return ErrInvalidConn
 	}
-	tx.conn.roTx.Close()
+	tx.close()
 	tx.conn = nil
 	return
 }
@@ -47,7 +49,7 @@ func (tx *roTx) Rollback() (err error) {
 	if tx.conn == nil || tx.conn.roTx == nil || tx.conn.closed.IsSet() {
 		return ErrInvalidConn
 	}
-	tx.conn.roTx.Close()
+	tx.close()
 	tx.conn = nil
 	return
 }

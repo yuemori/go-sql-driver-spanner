@@ -50,13 +50,6 @@ func init() {
 	dsn = fmt.Sprintf("projects/%s/instances/%s/databases/%s", project, instance, database)
 }
 
-var clientConfig = spanner.ClientConfig{
-	SessionPoolConfig: spanner.SessionPoolConfig{
-		MinOpened: 1,
-		MaxOpened: 10, // FIXME: integration_test requires more than a single session
-	},
-}
-
 type DBTest struct {
 	*testing.T
 	db     *sql.DB
@@ -227,7 +220,7 @@ func dropTable(ctx context.Context, t *testing.T) {
 		Statements: []string{"DROP TABLE test"},
 	})
 	if err != nil {
-		t.Fatalf("error drop table: %+v", err)
+		return
 	}
 
 	if err := op.Wait(ctx); err != nil {
@@ -335,22 +328,52 @@ func TestInvalidQuery(t *testing.T) {
 	})
 }
 
+func TestCancelTransaction(t *testing.T) {
+	runTests(t, dsn, func(dbt *DBTest) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		tx, err := dbt.db.BeginTx(ctx, nil)
+		if err != nil {
+			dbt.Fatal(err)
+		}
+
+		if _, err := tx.ExecContext(ctx, "INSERT INTO test (Id, Value) VALUES (\"userId1\", true)"); err != nil {
+			dbt.Fatal(err)
+		}
+
+		cancel()
+
+		if err := tx.Commit(); err != context.Canceled {
+			dbt.Errorf("expected context.Canceled, got %v", err)
+		}
+	})
+}
+
 func TestReadOnlyTransaction(t *testing.T) {
 	runTests(t, dsn, func(dbt *DBTest) {
-		ctx := context.Background()
+		ctx, cancel := context.WithCancel(context.Background())
 		tx, err := dbt.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
 			dbt.Fatal(err)
 		}
 
-		defer tx.Rollback()
-
-		if _, err := tx.QueryContext(ctx, "SELECT * FROM test"); err != nil {
-			dbt.Errorf("expected nil, got %v", err)
-		}
+		defer cancel()
 
 		if _, err := tx.ExecContext(ctx, "INSERT INTO test VALUES (true)"); err != ErrWriteInReadOnlyTransaction {
 			dbt.Errorf("expected ErrWriteInReadOnlyTransaction, got %v", err)
+		}
+
+		var v int
+		row := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM test")
+		if err := row.Scan(&v); err != nil {
+			dbt.Fatal(err)
+		}
+		if v != 0 {
+			dbt.Errorf("expected val to be 0, got %d", v)
+		}
+
+		if err := tx.Commit(); err != nil {
+			dbt.Fatal(err)
 		}
 	})
 }

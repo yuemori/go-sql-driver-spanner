@@ -16,7 +16,13 @@ type spannerConn struct {
 	roTx *spanner.ReadOnlyTransaction
 	rwTx *spanner.ReadWriteStmtBasedTransaction
 
-	closed atomicBool
+	// for context support (Go 1.8+)
+	watching bool
+	watcher  chan<- context.Context
+	closech  chan struct{}
+	finished chan<- struct{}
+	canceled atomicError // set non-nil if conn is canceled
+	closed   atomicBool
 }
 
 // Prepare implements database/sql/driver.Conn interface
@@ -40,6 +46,7 @@ func (c *spannerConn) cleanup() {
 		return
 	}
 
+	close(c.closech)
 	if c.roTx != nil {
 		c.roTx.Close()
 	}
@@ -65,13 +72,18 @@ func (c *spannerConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		return nil, driver.ErrBadConn
 	}
 
+	if err := c.watchCancel(ctx); err != nil {
+		return nil, err
+	}
+	defer c.finish()
+
 	if c.inTransaction() {
 		return nil, errors.New("already in a transaction")
 	}
 
 	if opts.ReadOnly {
 		c.roTx = c.client.ReadOnlyTransaction().WithTimestampBound(spanner.StrongRead())
-		return &roTx{ctx: ctx, close: func() {
+		return &roTx{ctx: ctx, conn: c, close: func() {
 			c.roTx.Close()
 			c.roTx = nil
 		}}, nil
@@ -83,7 +95,7 @@ func (c *spannerConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		return nil, err
 	}
 
-	return &rwTx{ctx: ctx, close: func() {
+	return &rwTx{ctx: ctx, conn: c, close: func() {
 		c.rwTx = nil
 	}}, nil
 }
@@ -99,6 +111,10 @@ func (c *spannerConn) ExecContext(ctx context.Context, query string, args []driv
 		errLog.Print(ErrInvalidConn)
 		return nil, driver.ErrBadConn
 	}
+	if err := c.watchCancel(ctx); err != nil {
+		return nil, err
+	}
+	defer c.finish()
 
 	if c.roTx != nil {
 		return nil, ErrWriteInReadOnlyTransaction
@@ -126,18 +142,24 @@ func (c *spannerConn) QueryContext(ctx context.Context, query string, args []dri
 }
 
 // Ping implements database/sql/driver.Pinger interface
-func (c *spannerConn) Ping(ctx context.Context) error {
+func (c *spannerConn) Ping(ctx context.Context) (err error) {
 	if c.closed.IsSet() {
 		errLog.Print(ErrInvalidConn)
 		return driver.ErrBadConn
 	}
+
+	if err = c.watchCancel(ctx); err != nil {
+		return
+	}
+	defer c.finish()
+
 	if c.inTransaction() {
 		return nil
 	}
 
-	_, err := c.query(context.Background(), "SELECT 1", []driver.NamedValue{})
+	_, err = c.query(context.Background(), "SELECT 1", []driver.NamedValue{})
 
-	return err
+	return
 }
 
 // ResetSession implements database/sql/driver.SessionResetter interface
@@ -177,11 +199,15 @@ func (c *spannerConn) execContextInNewRWTransaction(ctx context.Context, stateme
 	return rowsAffected, nil
 }
 
-func (conn *spannerConn) query(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if conn.closed.IsSet() {
+func (c *spannerConn) query(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.closed.IsSet() {
 		errLog.Print(ErrInvalidConn)
 		return nil, driver.ErrBadConn
 	}
+	if err := c.watchCancel(ctx); err != nil {
+		return nil, err
+	}
+	defer c.finish()
 
 	ss, err := prepareSpannerStmt(query, args)
 	if err != nil {
@@ -189,12 +215,12 @@ func (conn *spannerConn) query(ctx context.Context, query string, args []driver.
 	}
 
 	var it *spanner.RowIterator
-	if conn.roTx != nil {
-		it = conn.roTx.Query(ctx, ss)
-	} else if conn.rwTx != nil {
-		it = conn.rwTx.Query(ctx, ss)
+	if c.roTx != nil {
+		it = c.roTx.Query(ctx, ss)
+	} else if c.rwTx != nil {
+		it = c.rwTx.Query(ctx, ss)
 	} else {
-		it = conn.client.Single().Query(ctx, ss)
+		it = c.client.Single().Query(ctx, ss)
 	}
 
 	row, err := it.Next()
@@ -223,4 +249,82 @@ func (c *spannerConn) prepare(query string) (*spannerStmt, error) {
 
 func (c *spannerConn) inTransaction() bool {
 	return c.roTx != nil || c.rwTx != nil
+}
+
+// finish is called when the query has canceled.
+func (c *spannerConn) cancel(err error) {
+	c.canceled.Set(err)
+	c.cleanup()
+}
+
+func (c *spannerConn) error() error {
+	if c.closed.IsSet() {
+		if err := c.canceled.Value(); err != nil {
+			return err
+		}
+		return ErrInvalidConn
+	}
+	return nil
+}
+
+// finish is called when the query has succeeded.
+func (c *spannerConn) finish() {
+	if !c.watching || c.finished == nil {
+		return
+	}
+	select {
+	case c.finished <- struct{}{}:
+		c.watching = false
+	case <-c.closech:
+	}
+}
+
+func (c *spannerConn) watchCancel(ctx context.Context) error {
+	if c.watching {
+		// Reach here if canceled,
+		// so the connection is already invalid
+		c.cleanup()
+		return nil
+	}
+	// When ctx is already cancelled, don't watch it.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// When ctx is not cancellable, don't watch it.
+	if ctx.Done() == nil {
+		return nil
+	}
+	// When watcher is not alive, can't watch it.
+	if c.watcher == nil {
+		return nil
+	}
+
+	c.watching = true
+	c.watcher <- ctx
+	return nil
+}
+
+func (mc *spannerConn) startWatcher() {
+	watcher := make(chan context.Context, 1)
+	mc.watcher = watcher
+	finished := make(chan struct{})
+	mc.finished = finished
+	go func() {
+		for {
+			var ctx context.Context
+			select {
+			case ctx = <-watcher:
+			case <-mc.closech:
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				mc.cancel(ctx.Err())
+			case <-finished:
+			case <-mc.closech:
+				return
+			}
+		}
+	}()
 }

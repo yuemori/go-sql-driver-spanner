@@ -37,3 +37,24 @@ func (ab *atomicBool) TrySet(value bool) bool {
 	}
 	return atomic.SwapUint32(&ab.value, 0) > 0
 }
+
+// atomicError is a wrapper for atomically accessed error values
+type atomicError struct {
+	_noCopy noCopy
+	value   atomic.Value
+}
+
+// Set sets the error value regardless of the previous value.
+// The value must not be nil
+func (ae *atomicError) Set(value error) {
+	ae.value.Store(value)
+}
+
+// Value returns the current error value
+func (ae *atomicError) Value() error {
+	if v := ae.value.Load(); v != nil {
+		// this will panic if the value doesn't implement the error interface
+		return v.(error)
+	}
+	return nil
+}
