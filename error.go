@@ -8,7 +8,8 @@ import (
 )
 
 var (
-	ErrInvalidConn = errors.New("invalid connection")
+	ErrInvalidConn                = errors.New("invalid connection")
+	ErrWriteInReadOnlyTransaction = errors.New("cannot write in read-only transaction")
 )
 
 // Logger is used to log critical error messages.

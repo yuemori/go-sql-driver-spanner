@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"database/sql"
 	"database/sql/driver"
@@ -330,6 +331,73 @@ func TestInvalidQuery(t *testing.T) {
 		_, err := dbt.db.Query("this is invalid query")
 		if err == nil {
 			dbt.Fatal("db.Query does not returns expected error")
+		}
+	})
+}
+
+func TestReadOnlyTransaction(t *testing.T) {
+	runTests(t, dsn, func(dbt *DBTest) {
+		ctx := context.Background()
+		tx, err := dbt.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			dbt.Fatal(err)
+		}
+
+		defer tx.Rollback()
+
+		if _, err := tx.QueryContext(ctx, "SELECT * FROM test"); err != nil {
+			dbt.Errorf("expected nil, got %v", err)
+		}
+
+		if _, err := tx.ExecContext(ctx, "INSERT INTO test VALUES (true)"); err != ErrWriteInReadOnlyTransaction {
+			dbt.Errorf("expected ErrWriteInReadOnlyTransaction, got %v", err)
+		}
+	})
+}
+
+func TestContextCancelBegin(t *testing.T) {
+	runTests(t, dsn, func(dbt *DBTest) {
+		ctx, cancel := context.WithCancel(context.Background())
+		conn, err := dbt.db.Conn(ctx)
+		if err != nil {
+			dbt.Fatal(err)
+		}
+		defer conn.Close()
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			dbt.Fatal(err)
+		}
+
+		// Delay execution for just a bit until db.ExecContext has begun.
+		defer time.AfterFunc(100*time.Millisecond, cancel).Stop()
+
+		time.Sleep(200 * time.Millisecond)
+
+		// This query will be canceled.
+		startTime := time.Now()
+		if _, err := tx.ExecContext(ctx, "INSERT INTO test VALUES (true)"); err != context.Canceled {
+			dbt.Errorf("expected context.Canceled, got %v", err)
+		}
+		if d := time.Since(startTime); d > 500*time.Millisecond {
+			dbt.Errorf("too long execution time: %s", d)
+		}
+
+		// Transaction is canceled, so expect an error.
+		switch err := tx.Commit(); err {
+		case sql.ErrTxDone:
+			// because the transaction has already been rollbacked.
+			// the database/sql package watches ctx
+			// and rollbacks when ctx is canceled.
+		case context.Canceled:
+			// the database/sql package rollbacks on another goroutine,
+			// so the transaction may not be rollbacked depending on goroutine scheduling.
+		default:
+			dbt.Errorf("expected sql.ErrTxDone or context.Canceled, got %v", err)
+		}
+
+		// cannot begin a transaction (on a different conn) with a canceled context
+		if _, err := dbt.db.BeginTx(ctx, nil); err != context.Canceled {
+			dbt.Errorf("expected context.Canceled, got %v", err)
 		}
 	})
 }

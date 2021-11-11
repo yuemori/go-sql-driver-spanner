@@ -2,63 +2,52 @@ package spannerdriver
 
 import (
 	"context"
-
-	"cloud.google.com/go/spanner"
-	"github.com/yuemori/go-sql-driver-spanner/internal"
 )
 
-type roTx struct {
+type rwTx struct {
+	conn  *spannerConn
+	ctx   context.Context
 	close func()
 }
 
-func (tx *roTx) Commit() error {
-	tx.close()
-	return nil
+type roTx struct {
+	conn  *spannerConn
+	ctx   context.Context
+	close func()
 }
 
-func (tx *roTx) Rollback() error {
-	tx.close()
-	return nil
-}
-
-type rwTx struct {
-	connector *internal.RWConnector
-	close     func()
-}
-
-func (tx *rwTx) Query(ctx context.Context, stmt spanner.Statement) *spanner.RowIterator {
-	tx.connector.QueryIn <- &internal.RWQueryMessage{
-		Ctx:  ctx,
-		Stmt: stmt,
+func (tx *rwTx) Commit() (err error) {
+	if tx.conn == nil || tx.conn.rwTx == nil || tx.conn.closed.IsSet() {
+		return ErrInvalidConn
 	}
-	msg := <-tx.connector.QueryOut
-	return msg.It
+	_, err = tx.conn.rwTx.Commit(tx.ctx)
+	tx.conn = nil
+	return
 }
 
-func (tx *rwTx) ExecContext(ctx context.Context, stmt spanner.Statement) (int64, error) {
-	tx.connector.ExecIn <- &internal.RWExecMessage{
-		Ctx:  ctx,
-		Stmt: stmt,
+func (tx *rwTx) Rollback() (err error) {
+	if tx.conn == nil || tx.conn.rwTx == nil || tx.conn.closed.IsSet() {
+		return ErrInvalidConn
 	}
-	msg := <-tx.connector.ExecOut
-	return msg.Rows, msg.Error
+	tx.conn.rwTx.Rollback(tx.ctx)
+	tx.conn = nil
+	return
 }
 
-func (tx *rwTx) Commit() error {
-	tx.connector.CommitIn <- struct{}{}
-	err := <-tx.connector.Errors
-	if err == nil {
-		tx.close()
+func (tx *roTx) Commit() (err error) {
+	if tx.conn == nil || tx.conn.roTx == nil || tx.conn.closed.IsSet() {
+		return ErrInvalidConn
 	}
-	return err
+	tx.conn.roTx.Close()
+	tx.conn = nil
+	return
 }
 
-func (tx *rwTx) Rollback() error {
-	tx.connector.RollbackIn <- struct{}{}
-	err := <-tx.connector.Errors
-	if err == internal.ErrAborted {
-		tx.close()
-		return nil
+func (tx *roTx) Rollback() (err error) {
+	if tx.conn == nil || tx.conn.roTx == nil || tx.conn.closed.IsSet() {
+		return ErrInvalidConn
 	}
-	return err
+	tx.conn.roTx.Close()
+	tx.conn = nil
+	return
 }

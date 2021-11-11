@@ -3,7 +3,6 @@ package spannerdriver
 import (
 	"context"
 	"database/sql/driver"
-	"time"
 
 	"cloud.google.com/go/spanner"
 	"github.com/pkg/errors"
@@ -15,7 +14,7 @@ type spannerConn struct {
 	client *spanner.Client
 
 	roTx *spanner.ReadOnlyTransaction
-	rwTx *rwTx
+	rwTx *spanner.ReadWriteStmtBasedTransaction
 
 	closed atomicBool
 }
@@ -41,6 +40,14 @@ func (c *spannerConn) cleanup() {
 		return
 	}
 
+	if c.roTx != nil {
+		c.roTx.Close()
+	}
+
+	if c.rwTx != nil {
+		c.rwTx.Rollback(context.Background())
+	}
+
 	c.roTx = nil
 	c.rwTx = nil
 	c.client = nil
@@ -64,31 +71,21 @@ func (c *spannerConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 
 	if opts.ReadOnly {
 		c.roTx = c.client.ReadOnlyTransaction().WithTimestampBound(spanner.StrongRead())
-		return &roTx{close: func() {
+		return &roTx{ctx: ctx, close: func() {
 			c.roTx.Close()
 			c.roTx = nil
 		}}, nil
 	}
 
-	connector := internal.NewRWConnector(ctx, c.client)
-	c.rwTx = &rwTx{
-		connector: connector,
-		close: func() {
-			c.rwTx = nil
-		},
+	var err error
+	c.rwTx, err = spanner.NewReadWriteStmtBasedTransaction(ctx, c.client)
+	if err != nil {
+		return nil, err
 	}
 
-	// TODO(jbd): Make sure we are not leaking
-	// a goroutine in connector if timeout happens.
-	select {
-	case <-connector.Ready:
-		return c.rwTx, nil
-	case err := <-connector.Errors: // If received before Ready, transaction failed to start.
-		return nil, err
-	case <-time.Tick(10 * time.Second):
-		return nil, errors.New("cannot begin transaction, timeout after 10 seconds")
-	}
-	return nil, notImplementedError(c, "BeginTx")
+	return &rwTx{ctx: ctx, close: func() {
+		c.rwTx = nil
+	}}, nil
 }
 
 // PrepareContext implements database/sql/driver.ConnPrepareContext interface
@@ -104,7 +101,7 @@ func (c *spannerConn) ExecContext(ctx context.Context, query string, args []driv
 	}
 
 	if c.roTx != nil {
-		return nil, errors.New("cannot write in read-only transaction")
+		return nil, ErrWriteInReadOnlyTransaction
 	}
 	ss, err := prepareSpannerStmt(query, args)
 	if err != nil {
@@ -115,7 +112,7 @@ func (c *spannerConn) ExecContext(ctx context.Context, query string, args []driv
 	if c.rwTx == nil {
 		rowsAffected, err = c.execContextInNewRWTransaction(ctx, ss)
 	} else {
-		rowsAffected, err = c.rwTx.ExecContext(ctx, ss)
+		rowsAffected, err = c.rwTx.Update(ctx, ss)
 	}
 	if err != nil {
 		return nil, err
@@ -148,7 +145,13 @@ func (c *spannerConn) ResetSession(ctx context.Context) error {
 	if c.closed.IsSet() {
 		return driver.ErrBadConn
 	}
+	if c.roTx != nil {
+		c.roTx.Close()
+	}
 	c.roTx = nil
+	if c.rwTx != nil {
+		c.rwTx.Rollback(ctx)
+	}
 	c.rwTx = nil
 
 	return nil
