@@ -16,8 +16,11 @@ type SpannerDriver struct{}
 
 // Open implements database/sql/driver.Driver interface
 func (d *SpannerDriver) Open(database string) (driver.Conn, error) {
-	cfg := &Config{database: database}
-	connector := &SpannerConnector{cfg: cfg}
+	cfg := &Config{Database: database}
+	connector, err := NewConnector(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return connector.Connect(context.Background())
 }
 

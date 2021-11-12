@@ -6,7 +6,7 @@ import (
 )
 
 type Config struct {
-	database string
+	Database string
 
 	ClientConfig  spanner.ClientConfig
 	ClientOptions []option.ClientOption
@@ -14,7 +14,7 @@ type Config struct {
 
 func NewConfig(database string) *Config {
 	return &Config{
-		database:      database,
+		Database:      database,
 		ClientOptions: make([]option.ClientOption, 0),
 	}
 }

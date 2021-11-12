@@ -9,8 +9,11 @@ import (
 )
 
 type SpannerConnector struct {
-	cfg    *Config
 	client *spanner.Client
+}
+
+func NewConnectorWithClient(client *spanner.Client) driver.Connector {
+	return &SpannerConnector{client: client}
 }
 
 // NewConnector returns database/sql/driver.Connector implementation for cloud spanner.
@@ -18,14 +21,14 @@ func NewConnector(cfg *Config) (driver.Connector, error) {
 	opts := append(cfg.ClientOptions, option.WithUserAgent(userAgent))
 	client, err := spanner.NewClientWithConfig(
 		context.Background(),
-		cfg.database,
+		cfg.Database,
 		cfg.ClientConfig,
 		opts...,
 	)
 	if err != nil {
 		return nil, err
 	}
-	return &SpannerConnector{cfg: cfg, client: client}, nil
+	return &SpannerConnector{client: client}, nil
 }
 
 func (c *SpannerConnector) Client() *spanner.Client {
